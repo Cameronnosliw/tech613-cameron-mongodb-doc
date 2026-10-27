@@ -1,0 +1,122 @@
+# Tech 613 - Two-Tier Architecture Deployment Guide
+
+## 1. Architectural Overview & Why Database First
+
+A **two-tier architecture** decouples the presentation/logic tier (Node.js web application + Nginx reverse proxy) from the data persistence tier (MongoDB database).
+
+### Why Deploy the Database Tier First?
+The database must be fully provisioned, running, and accessible before configuring the application tier. During the app setup, running `npm install` triggers an automated `postinstall` script (`node seeds/seed.js`). If the database is offline or unreachable at that moment, the installation script attempts to connect, and terminates with a timed out error.
+
+---
+
+## 2. How We Get the MongoDB Tier Working
+
+We first launch and configure the EC2 instance handling the database:
+
+1. **Instance Setup:** Follow standard conventions using Ubuntu 24.04 LTS, instance type **`t3.micro`**, and our existing SSH key pair (`tech613-cameron-aws-key.pem`).
+2. **Security Group Configuration (`tech613-cameron-mongodb-sg`):**
+   * **Port 22 (SSH):** Open to `My IP` (or `0.0.0.0/0`) for terminal administration.
+   * **Port 27017 (Custom TCP):** Open to `0.0.0.0/0`.
+   * **Why Port 27017?** Port 27017 is MongoDB's default communication port. In AWS, all inbound ports are closed by default in a new Security Group. If Port 27017 is not explicitly opened, AWS silently drops all inbound database requests from the application tier, causing connection timeouts.
+3. **Connect to the Instance:**
+   ```bash
+   ssh -i ~/.ssh/tech613-cameron-aws-key.pem ubuntu@<DB-PUBLIC-IP>
+   ```
+4. **Update package lists:**
+   ```bash
+   sudo apt update -y
+   ```
+   *(The `-y` flag answers "yes" to prompts, automating package downloads without manual confirmation).*
+5. **Upgrade installed packages:**
+   ```bash
+   sudo apt upgrade -y
+   ```
+6. **Import the MongoDB 7.0 GPG Key:**
+   ```bash
+   curl -fsSL [https://www.mongodb.org/static/pgp/server-7.0.asc](https://www.mongodb.org/static/pgp/server-7.0.asc) | \
+       sudo gpg -o /usr/share/keyrings/mongodb-server-7.0.gpg --dearmor
+   ```
+   *Downloads MongoDB's official security key and adds it to Ubuntu's trusted list so the system can verify that the downloaded software is authentic and untampered with.*
+7. **Add the MongoDB Repository List:**
+   ```bash
+   echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] [https://repo.mongodb.org/apt/ubuntu](https://repo.mongodb.org/apt/ubuntu) jammy/mongodb-org/7.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-7.0.list
+   ```
+8. **Refresh package index:**
+   ```bash
+   sudo apt update -y
+   ```
+9. **Install MongoDB 7.0 Packages:**
+   ```bash
+   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+       mongodb-org=7.0.22 \
+       mongodb-org-database=7.0.22 \
+       mongodb-org-server=7.0.22 \
+       mongodb-mongosh \
+       mongodb-org-shell=7.0.22 \
+       mongodb-org-mongos=7.0.22 \
+       mongodb-org-tools=7.0.22 \
+       mongodb-org-database-tools-extra=7.0.22
+   ```
+10. **Edit Configuration (`sudo nano /etc/mongod.conf`):**
+    * **What happens here:** By default, MongoDB has `bindIp: 127.0.0.1` configured under the `net:` section. This restricts MongoDB to listen only to internal loopback connections from inside its own VM, rejecting any connection from outside.
+    * **The Fix:** We change `bindIp: 127.0.0.1` to **`bindIp: 0.0.0.0`** (or run `sudo sed -i 's/bindIp: 127.0.0.1/bindIp: 0.0.0.0/' /etc/mongod.conf`). This instructs MongoDB to bind and listen on all network interfaces, allowing the separate App VM to connect.
+11. **Start the MongoDB service:**
+    ```bash
+    sudo systemctl enable mongod
+    sudo systemctl start mongod
+    ```
+12. **Verify Database Service Status:**
+    ```bash
+    sudo systemctl status mongod
+    ```
+    *Confirm MongoDB is active (running) and listening on `0.0.0.0:27017`.*
+13. **Note the Database Private IP:** Copy the Private IPv4 Address of the DB instance from the AWS Console to use in the application configuration.
+
+---
+
+## 3. Setting Up the 2nd Tier: App VM
+
+1. **Leverage the Pre-Baked AMI:**
+   * Instead of manually re-installing Node.js, Nginx, and cloning the application, we launch from our custom image (`tech613-cameron-ttt-ami`).
+2. **Launch Instance:**
+   * Select the custom AMI and click **Launch instance from AMI**.
+   * **Instance Type:** `t3.micro`
+   * **Security Group:** Attach `tech613-cameron-app-sg` with **Port 22 (SSH)** and **Port 80 (HTTP)** open inbound. *(Port 3000 does not need to be open to the public because the Nginx reverse proxy routes Port 80 to Port 3000 locally)*.
+   * **Key Pair:** Select `tech613-cameron-aws-key.pem`.
+3. **Connect to the App VM:**
+   ```bash
+   ssh -i ~/.ssh/tech613-cameron-aws-key.pem ubuntu@<APP-PUBLIC-IP>
+   ```
+   Check PM2 and Nginx status:
+   ```bash
+   pm2 status
+   sudo systemctl status nginx
+   ```
+4. **Configure the Database Environment Variable (`MONGODB_URI`):**
+   * We set `MONGODB_URI` using the **Private IP** of the MongoDB VM. We use the Private IP rather than the Public IP because both VMs reside in the same AWS VPC; internal private traffic is secure, incurs no internet bandwidth fees, and remains unaffected by dynamic public IP reassignment upon VM restarts.
+   ```bash
+   export MONGODB_URI="mongodb://<DB-PRIVATE-IP>:27017/tictactoe"
+   ```
+   *To make this permanent across shell sessions and reboots:*
+   ```bash
+   echo 'export MONGODB_URI="mongodb://<DB-PRIVATE-IP>:27017/tictactoe"' >> ~/.bashrc
+   ```
+5. **Navigate into the App Directory:**
+   * Move into the exact subfolder containing `package.json`:
+   ```bash
+   cd /home/ubuntu/app/app
+   ```
+6. **Install Dependencies & Seed Database:**
+   ```bash
+   npm install
+   ```
+   *Because `MONGODB_URI` is set and reachable, the post-install script executes and prints:*
+   `Seeded MongoDB scoreboard_entries directly via MONGODB_URI (10 records).`
+7. **Restart the Application with PM2:**
+   ```bash
+   pm2 restart sparta-tictactoe --update-env
+   pm2 save
+   ```
+8. **Verify Web App in Browser:**
+   * Open a browser and navigate to `http://<APP-PUBLIC-IP>`.
+   * Confirm the Tic-Tac-Toe game board loads on Port 80 and the database scoreboard displays data retrieved from the MongoDB tier.
